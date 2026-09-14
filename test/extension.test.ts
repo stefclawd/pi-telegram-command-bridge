@@ -83,6 +83,59 @@ describe("pi-telegram-command-bridge", () => {
     expect(recorded.userMessages[0].options?.expandPromptTemplates).toBe(true);
   });
 
+  it("forwards a command when pi-telegram appended a [time] context line", async () => {
+    const { result, recorded } = await run(
+      null,
+      inputEvent("[telegram] /project\n\n[time] 2026-09-14 11:00:58 Europe/Berlin"),
+    );
+    expect(result).toEqual({ action: "handled" });
+    expect(recorded.userMessages[0].content).toBe("/project");
+  });
+
+  it("forwards a command with args when a [time] line follows", async () => {
+    const { result, recorded } = await run(
+      null,
+      inputEvent(
+        "[telegram] /project memory\n\n[time] 2026-09-14 11:00:58 Europe/Berlin",
+      ),
+    );
+    expect(result).toEqual({ action: "handled" });
+    expect(recorded.userMessages[0].content).toBe("/project memory");
+  });
+
+  it("strips attribute variants of the telegram tag ([telegram|thread:...])", async () => {
+    const { result, recorded } = await run(
+      null,
+      inputEvent(
+        "[telegram|thread:foo] /project memory\n\n[time] 2026-09-14 11:00:58 Europe/Berlin",
+      ),
+    );
+    expect(result).toEqual({ action: "handled" });
+    expect(recorded.userMessages[0].content).toBe("/project memory");
+  });
+
+  it("discards attachment sections, keeping only the command line", async () => {
+    const { result, recorded } = await run(
+      null,
+      inputEvent(
+        "/project\n\n[attachments] /tmp\n- /tmp/a.png\n\n[time] 2026-09-14 11:00:58 Europe/Berlin",
+      ),
+    );
+    expect(result).toEqual({ action: "handled" });
+    expect(recorded.userMessages[0].content).toBe("/project");
+  });
+
+  it("ignores reply turns (no leading slash command after the reply header)", async () => {
+    const { result, recorded } = await run(
+      null,
+      inputEvent(
+        "[telegram] [reply|from:Stefan] what about this?\n\n[time] 2026-09-14 11:00:58 Europe/Berlin",
+      ),
+    );
+    expect(result).toEqual({ action: "continue" });
+    expect(recorded.userMessages).toHaveLength(0);
+  });
+
   it("forwards an extension command without the telegram tag", async () => {
     const { result, recorded } = await run(null, inputEvent("/project foo"));
     expect(result).toEqual({ action: "handled" });
