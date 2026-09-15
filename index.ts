@@ -24,6 +24,26 @@
  *   input event fires. Non-commands fall through once; a re-dispatch
  *   marker prevents loops.
  *
+ * Settling the Telegram dispatch queue:
+ *   pi-telegram marks a dispatched prompt as pending and only settles it
+ *   (clears its pending flag and consumes the queue item) when an agent
+ *   turn starts (agent_start). Extension commands run without a model
+ *   turn, so a bridged command that triggers no LLM interaction of its
+ *   own (e.g. "/project" with no arguments, which only calls
+ *   ctx.ui.notify) would leave the pending flag set forever — every later
+ *   Telegram message then queues up but is never dispatched (status shows
+ *   "+N", the typing indicator never stops, the bridge is wedged until
+ *   the session restarts).
+ *
+ *   After re-dispatching a command, the bridge therefore watches for the
+ *   next agent_start. Commands that start a turn themselves settle the
+ *   queue that way (session switches announce via a sendUserMessage
+ *   follow-up; skill commands expand into real prompts). If no agent turn
+ *   arrives within the check window, the bridge sends one short settle
+ *   prompt: that turn gives pi-telegram the agent_start it needs, and its
+ *   reply is delivered to Telegram as the answer to the original command
+ *   message — which also gives the user visible confirmation on the phone.
+ *
  * Scope:
  *   - Only source "extension" prompts are intercepted (Telegram queue
  *     dispatch, generated-control-surface buttons, generative-app
@@ -56,9 +76,9 @@
  *
  * Reply visibility: command handlers notify via ctx.ui (TUI/RPC notify);
  * in RPC mode those surface as extension_ui_request events, which the
- * daemon logs. Telegram side shows no echo — the command's own
- * announcement (pi.sendUserMessage followUp from the handler) lands in
- * the session and the bridge replies normally on the next turn.
+ * daemon logs. Telegram side shows no echo — but every bridged command
+ * that produces no agent turn of its own is followed by the settle turn
+ * described above, whose confirmation reply does reach the Telegram chat.
  */
 
 import type { ExtensionAPI, InputEvent, InputEventResult } from "@earendil-works/pi-coding-agent";
@@ -90,12 +110,69 @@ function firstToken(text: string): string {
   return spaceIndex === -1 ? trimmed : trimmed.slice(0, spaceIndex);
 }
 
+/**
+ * How long to wait for an agent turn (agent_start) after re-dispatching a
+ * command before assuming the command produced none and sending the settle
+ * prompt. Command handlers that announce via sendUserMessage follow-ups
+ * start their turn within the handler execution itself, so this window is
+ * generous.
+ */
+const SETTLE_CHECK_MS = 3000;
+
+interface PendingSettle {
+  command: string;
+  timer: NodeJS.Timeout;
+}
+
+/**
+ * Commands dispatched from the Telegram queue that have not yet been
+ * settled by an agent turn. FIFO order matches pi-telegram's queue
+ * consumption (agent_start consumes the oldest dispatched item).
+ */
+const pendingSettles: PendingSettle[] = [];
+let settleToken = 0;
+
+function clearPendingSettles(): void {
+  for (const entry of pendingSettles) {
+    clearTimeout(entry.timer);
+  }
+  pendingSettles.length = 0;
+}
+
+/**
+ * One short prompt whose only job is to start an agent turn so pi-telegram
+ * settles the dispatched command. Its reply is delivered to Telegram as the
+ * answer to the original command message.
+ */
+function settlePromptText(command: string): string {
+  return (
+    `[telegram-command-bridge] The extension command \`${command}\` was just executed natively ` +
+    `outside the model loop; its output was routed to the local UI channel and is not visible in this conversation. ` +
+    `Reply with exactly one short line confirming the command ran (e.g. "✅ ${command} executed"). ` +
+    `Do not run it again and do not invent its output.`
+  );
+}
+
 export default function (pi: ExtensionAPI) {
+  /**
+   * Any agent turn start settles pi-telegram's pending dispatch: its
+   * agent-start hook consumes the dispatched queue item and clears the
+   * pending flag. Session starts do the same via a fresh session runtime
+   * (session switches reset the bridge state).
+   */
+  pi.on("agent_start", () => {
+    clearPendingSettles();
+  });
+  pi.on("session_start", () => {
+    clearPendingSettles();
+  });
+
   pi.on("input", async (event: InputEvent): Promise<InputEventResult> => {
     if (event.source !== "extension") return { action: "continue" };
 
     const raw = event.text.trimStart();
-    if (!raw.startsWith("/") && !TELEGRAM_PREFIX_RE.test(raw)) {
+    const telegramTagged = TELEGRAM_PREFIX_RE.test(raw);
+    if (!raw.startsWith("/") && !telegramTagged) {
       return { action: "continue" };
     }
 
@@ -139,6 +216,24 @@ export default function (pi: ExtensionAPI) {
     // identical commands keep working.
     redispatched.add(commandText);
     setTimeout(() => redispatched.delete(commandText), 60_000).unref?.();
+
+    // Watch for the settle: if this command produces no agent turn of its
+    // own, the Telegram dispatch pending flag would stay set forever and
+    // wedge the queue. Schedule a settle prompt (only for tagged telegram
+    // dispatches — other sendUserMessage surfaces have no Telegram queue
+    // to wedge). An arriving agent_start clears the entry first.
+    if (telegramTagged) {
+      const entry: PendingSettle = { command: commandText } as PendingSettle;
+      entry.timer = setTimeout(() => {
+        const index = pendingSettles.indexOf(entry);
+        if (index === -1) return; // settled meanwhile
+        pendingSettles.splice(index, 1);
+        pi.sendUserMessage(settlePromptText(commandText), { deliverAs: "followUp" });
+      }, SETTLE_CHECK_MS);
+      entry.timer.unref?.();
+      pendingSettles.push(entry);
+    }
+
     pi.sendUserMessage(commandText, {
       expandPromptTemplates: true,
       ...(event.streamingBehavior

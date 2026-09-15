@@ -20,11 +20,13 @@ interface Recorded {
 
 function createFakePi(commandNames: string[] = ["project"]) {
   const recorded: Recorded = { userMessages: [] };
-  const handlers = new Map<string, Handler>();
+  const handlerLists = new Map<string, Handler[]>();
 
   const pi = {
     on: vi.fn((event: string, handler: Handler) => {
-      handlers.set(event, handler);
+      const list = handlerLists.get(event) ?? [];
+      list.push(handler);
+      handlerLists.set(event, list);
     }),
     getCommands: vi.fn(() =>
       commandNames.map((name) => ({ name, source: "extension" })),
@@ -34,7 +36,7 @@ function createFakePi(commandNames: string[] = ["project"]) {
     }),
   };
 
-  return { pi, recorded, handlers };
+  return { pi, recorded, handlers: handlerLists };
 }
 
 function inputEvent(text: string, source = "extension") {
@@ -48,10 +50,10 @@ async function run(factory: any, event: any) {
   const mod = await import("../index.ts");
   const { pi, recorded, handlers } = createFakePi();
   (mod.default as any)(pi);
-  const handler = handlers.get("input");
+  const handler = handlers.get("input")?.[0];
   if (!handler) throw new Error("input handler not registered");
   const result = await handler(event, {});
-  return { result, recorded, pi };
+  return { result, recorded, pi, handlers };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -71,7 +73,6 @@ describe("pi-telegram-command-bridge", () => {
     (mod.default as any)(pi);
     expect(handlers.has("input")).toBe(true);
   });
-
   it("forwards an extension command from a telegram-tagged prompt", async () => {
     const { result, recorded } = await run(
       null,
@@ -197,5 +198,62 @@ describe("pi-telegram-command-bridge", () => {
     const third = await run(null, inputEvent("/project a"));
     // Fresh module → fresh guard → forwards again.
     expect(third.result).toEqual({ action: "handled" });
+  });
+
+  describe("settle prompt (Telegram dispatch lifecycle)", () => {
+    it("schedules a settle prompt for tagged commands when no agent turn starts", async () => {
+      const { recorded } = await run(null, inputEvent("[telegram] /project"));
+      expect(recorded.userMessages).toHaveLength(1); // only the re-dispatch
+      await vi.advanceTimersByTimeAsync(3100);
+      expect(recorded.userMessages).toHaveLength(2);
+      const settle = recorded.userMessages[1];
+      expect(settle.content).toContain("[telegram-command-bridge]");
+      expect(settle.content).toContain("/project");
+      expect(settle.options?.deliverAs).toBe("followUp");
+      // The settle prompt must not itself look like a command.
+      expect(settle.content.startsWith("/")).toBe(false);
+    });
+
+    it("does not schedule a settle for untagged extension-source commands", async () => {
+      const { recorded } = await run(null, inputEvent("/project"));
+      expect(recorded.userMessages).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(3100);
+      expect(recorded.userMessages).toHaveLength(1);
+    });
+
+    it("cancels the settle prompt when an agent turn starts in time", async () => {
+      const { pi, handlers, recorded } = await run(null, inputEvent("[telegram] /project"));
+      expect(recorded.userMessages).toHaveLength(1);
+      // Simulate an agent turn starting (command announced via its own follow-up).
+      const agentStart = handlers.get("agent_start")?.[0];
+      expect(agentStart).toBeDefined();
+      await agentStart!({}, {});
+      await vi.advanceTimersByTimeAsync(3100);
+      expect(recorded.userMessages).toHaveLength(1);
+    });
+
+    it("cancels the settle prompt when a session starts (session switch reset)", async () => {
+      const { handlers, recorded } = await run(null, inputEvent("[telegram] /project"));
+      const sessionStart = handlers.get("session_start")?.[0];
+      expect(sessionStart).toBeDefined();
+      await sessionStart!({}, {});
+      await vi.advanceTimersByTimeAsync(3100);
+      expect(recorded.userMessages).toHaveLength(1);
+    });
+
+    it("preserves pending settles across multiple queued commands and settles them in order", async () => {
+      const { pi, handlers, recorded } = createFakePi();
+      vi.resetModules();
+      const mod = await import("../index.ts");
+      (mod.default as any)(pi);
+      const handler = handlers.get("input")?.[0];
+      await handler!(inputEvent("[telegram] /project"), {});
+      await handler!(inputEvent("[telegram] /skill:review"), {});
+      expect(recorded.userMessages).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(3100);
+      expect(recorded.userMessages).toHaveLength(4);
+      expect(recorded.userMessages[2].content).toContain("/project");
+      expect(recorded.userMessages[3].content).toContain("/skill:review");
+    });
   });
 });
