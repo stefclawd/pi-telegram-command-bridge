@@ -44,6 +44,18 @@
  *   reply is delivered to Telegram as the answer to the original command
  *   message — which also gives the user visible confirmation on the phone.
  *
+ *   Session replacement (switchSession/newSession/fork/reload) invalidates
+ *   the captured `pi` between the re-dispatch and the settle timer firing:
+ *   a command like /project <name> can REPLACE the session, and the stale
+ *   timer then throws on pi.sendUserMessage and kills the daemon
+ *   (uncaught exception in a setTimeout callback). The pending settles are
+ *   therefore cleared on session_shutdown (fires on the old runtime before
+ *   invalidation) and on session_start (fresh runtime), and the timer
+ *   callback additionally guards the stale-ctx call. Skipping the settle
+ *   after a session switch is correct, not just safe: pi-telegram resets
+ *   its queue state on session replacement anyway, and the switcher
+ *   announces the switch from inside the replacement session.
+ *
  * Scope:
  *   - Only source "extension" prompts are intercepted (Telegram queue
  *     dispatch, generated-control-surface buttons, generative-app
@@ -159,11 +171,21 @@ export default function (pi: ExtensionAPI) {
    * agent-start hook consumes the dispatched queue item and clears the
    * pending flag. Session starts do the same via a fresh session runtime
    * (session switches reset the bridge state).
+   *
+   * session_shutdown runs on the OLD runtime BEFORE it is invalidated, so
+   * it is the last safe place to drop pending settle timers when a
+   * re-dispatched command is replacing the session right now
+   * (ctx.switchSession/newSession/fork/reload inside the command handler).
+   * Without this, a surviving 3s timer fires after invalidation and the
+   * stale pi.sendUserMessage throws uncaught → daemon exit.
    */
   pi.on("agent_start", () => {
     clearPendingSettles();
   });
   pi.on("session_start", () => {
+    clearPendingSettles();
+  });
+  pi.on("session_shutdown", () => {
     clearPendingSettles();
   });
 
@@ -228,7 +250,16 @@ export default function (pi: ExtensionAPI) {
         const index = pendingSettles.indexOf(entry);
         if (index === -1) return; // settled meanwhile
         pendingSettles.splice(index, 1);
-        pi.sendUserMessage(settlePromptText(commandText), { deliverAs: "followUp" });
+        // The re-dispatched command may have replaced the session (e.g.
+        // /project <name>), invalidating this captured `pi`. Never let a
+        // stale-context error escape into an uncaught timer callback.
+        try {
+          pi.sendUserMessage(settlePromptText(commandText), { deliverAs: "followUp" });
+        } catch {
+          // Session was replaced or the runtime reloaded: pi-telegram
+          // resets its dispatch queue on session replacement anyway, so
+          // there is nothing left to settle.
+        }
       }, SETTLE_CHECK_MS);
       entry.timer.unref?.();
       pendingSettles.push(entry);

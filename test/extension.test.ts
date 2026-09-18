@@ -241,6 +241,33 @@ describe("pi-telegram-command-bridge", () => {
       expect(recorded.userMessages).toHaveLength(1);
     });
 
+    it("cancels the settle prompt when the session shuts down (session replacement)", async () => {
+      // Regression: /project <name> replaces the session; the settle timer
+      // survived the replacement, fired on the stale pi, and crashed the
+      // daemon with an uncaught exception. session_shutdown must clear it.
+      const { handlers, recorded } = await run(null, inputEvent("[telegram] /project alpha"));
+      expect(recorded.userMessages).toHaveLength(1); // the re-dispatch
+      const sessionShutdown = handlers.get("session_shutdown")?.[0];
+      expect(sessionShutdown).toBeDefined();
+      await sessionShutdown!({ type: "session_shutdown", reason: "resume" }, {});
+      await vi.advanceTimersByTimeAsync(3100);
+      expect(recorded.userMessages).toHaveLength(1); // no settle prompt fired
+    });
+
+    it("swallows stale-ctx errors from the settle timer instead of crashing", async () => {
+      // Second line of defense: even if a settle timer somehow survives
+      // (e.g. an exotic shutdown ordering), a stale pi must not kill the
+      // daemon from inside the timer callback.
+      const { pi, handlers, recorded } = await run(null, inputEvent("[telegram] /project alpha"));
+      expect(recorded.userMessages).toHaveLength(1);
+      // Simulate session replacement: every captured-pi call now throws.
+      (pi.sendUserMessage as any).mockImplementation(() => {
+        throw new Error("This extension ctx is stale after session replacement or reload.");
+      });
+      await vi.advanceTimersByTimeAsync(3100);
+      expect(recorded.userMessages).toHaveLength(1); // no crash, no new message
+    });
+
     it("preserves pending settles across multiple queued commands and settles them in order", async () => {
       const { pi, handlers, recorded } = createFakePi();
       vi.resetModules();
