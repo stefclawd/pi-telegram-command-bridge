@@ -1,0 +1,45 @@
+# OpenSpec AI-tool scaffolding (only openspec/ dir is the source of truth)
+.agents/
+.amazonq/
+.augment/
+.bob/
+.claude/
+.cline/
+.clinerules/
+.codeartsdoer/
+.codeassistant/
+.codebuddy/
+.commandcode/
+.continue/
+.cospec/
+.crush/
+.cursor/
+.devin/
+.factory/
+.forge/
+# .github/ is NOT ignored: workflows live in the repo
+# .github/
+.gemini/
+.hermes/
+.iflow/
+.junie/
+.kilocode/
+.kimi-code/
+.kiwi/
+.lingma/
+.omp/
+.opencode/
+.pi/
+.qoder/
+.qwen/
+.roo/
+.rovodev/
+.trae/
+.vibe/
+.zcode/
+.zed/
+.kiro/
+
+# Node
+node_modules/
+package-lock.json
