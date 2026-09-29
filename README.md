@@ -24,6 +24,12 @@ Scope:
 - Only extension-registered commands (`pi.getCommands()` with `source: "extension"`) and skill commands (`/skill:name`) are forwarded. Built-in TUI commands and prompt templates are not (pi-telegram expands prompt templates itself).
 - A leading `[telegram]` tag (the bridge prefix) is stripped before matching; everything after the command name is preserved as arguments.
 
+## `/bridge-commands`
+
+The extension registers its own `/bridge-commands` command — naturally forwardable through the bridge itself — which lists everything the bridge can execute from Telegram, derived live from `pi.getCommands()`: extension-registered commands (`/name`, with descriptions) and skill commands (`/skill:name`). Each entry is rendered as a tappable `telegram_button` cell queuing the command. Built-in TUI commands (`/model`, `/new`, …) and prompt templates are deliberately not listed and not forwarded — the output says so.
+
+From the chat, send `/bridge-commands` and the reply is the list. The command is also available on native surfaces (TUI/RPC) via the local UI notification.
+
 ## Install
 
 ```bash

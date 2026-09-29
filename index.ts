@@ -123,6 +123,70 @@ function firstToken(text: string): string {
 }
 
 /**
+ * A command name that could alter button markup is rendered as plain
+ * list text only (never gets a button cell).
+ */
+function isUnsafeButtonName(name: string): boolean {
+  return /[{}|`\n]/.test(name);
+}
+
+interface BridgeableCommand {
+  /** Invocation as typed in the chat: "/project" or "/skill:voice". */
+  invocation: string;
+  /** Registry name ("project", "voice") for sorting. */
+  name: string;
+  description?: string;
+}
+
+/**
+ * Commands the bridge can forward, derived from the live registry at
+ * handler run time: extension commands ("/name") and skill commands
+ * ("/skill:name"). Prompt-template commands and built-in TUI commands are
+ * not bridgeable and therefore not listed.
+ */
+function bridgeableCommands(pi: ExtensionAPI): BridgeableCommand[] {
+  const out: BridgeableCommand[] = [];
+  for (const command of pi.getCommands()) {
+    if (command.source === "extension") {
+      out.push({ invocation: `/${command.name}`, name: command.name, description: command.description });
+    } else if (command.source === "skill") {
+      out.push({ invocation: `/skill:${command.name}`, name: command.name, description: command.description });
+    }
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Follow-up prompt for a Telegram-dispatched /bridge-commands: carries the
+ * authoritative list and a pre-rendered telegram_button block the model
+ * copies verbatim, so the chat sees exactly what the registry contains.
+ */
+function buildBridgeCommandsPrompt(commands: BridgeableCommand[]): string {
+  const listLines = commands.length
+    ? commands
+        .map((c) => `  ${c.invocation}${c.description ? ` — ${c.description}` : ""}`)
+        .join("\n")
+    : "  (none registered)";
+
+  const buttonCells = commands
+    .filter((c) => !isUnsafeButtonName(c.name))
+    .map((c) => `{${c.invocation}|${c.invocation}}`)
+    .join("\n");
+  const buttonBlock =
+    buttonCells.length > 0
+      ? "\n\n```telegram_button\n" + buttonCells + "\n```"
+      : "";
+
+  return (
+    `[telegram-command-bridge] The user ran /bridge-commands via Telegram and expects the list of commands this bridge can execute.\n` +
+    `Authoritative list (do not re-derive, do not add or remove entries):\n` +
+    `Bridgeable commands (tap a button or type the command):\n${listLines}\n\n` +
+    `Built-in TUI commands (like /model or /new) and prompt templates are not bridgeable from Telegram.\n\n` +
+    `Reply in the chat with exactly this list (without the backticks) followed by the button block below, copied verbatim. Add nothing else.${buttonBlock}`
+  );
+}
+
+/**
  * How long to wait for an agent turn (agent_start) after re-dispatching a
  * command before assuming the command produced none and sending the settle
  * prompt. Command handlers that announce via sendUserMessage follow-ups
@@ -272,5 +336,40 @@ export default function (pi: ExtensionAPI) {
         : {}),
     });
     return { action: "handled" };
+  });
+
+  // ── /bridge-commands: list what this bridge can forward ───────────────
+  //
+  // Registered like any other extension command, so a Telegram-originated
+  // "/bridge-commands" flows through the input handler above and executes
+  // here with the full ExtensionCommandContext — no special casing.
+  pi.registerCommand("bridge-commands", {
+    description: "List the commands this bridge can execute from Telegram",
+    handler: async (_args, ctx) => {
+      const commands = bridgeableCommands(pi);
+      const listLines = commands.length
+        ? commands
+            .map((c) => `  ${c.invocation}${c.description ? ` — ${c.description}` : ""}`)
+            .join("\n")
+        : "  (none registered)";
+      ctx.ui.notify(
+        `Bridgeable commands (extension + skill):\n${listLines}\n\n` +
+        `Built-in TUI commands and prompt templates are not bridgeable.`,
+        "info"
+      );
+      // Telegram delivery: a follow-up turn whose reply is the list with
+      // tappable buttons. Dispatched synchronously inside the handler, so
+      // its agent_start also settles the pending dispatch of the
+      // Telegram message that ran this command (the 3s settle timer
+      // always finds the turn and never fires).
+      try {
+        pi.sendUserMessage(buildBridgeCommandsPrompt(commands), {
+          deliverAs: "followUp",
+        });
+      } catch {
+        // E.g. the runtime was replaced mid-handler: the local notify
+        // above already covered the native surface; nothing else to do.
+      }
+    },
   });
 }

@@ -1,0 +1,9 @@
+schema: spec-driven
+
+# Project context (shown to AI when creating artifacts)
+context: |
+  Single-file TypeScript pi extension (index.ts), loaded by pi via jiti - no build step.
+  Tests: vitest (test/extension.test.ts), fake ExtensionAPI pattern.
+  Conventional commits. English only. No emojis in code/docs except established UI text.
+  Companion extension for @llblab/pi-telegram: bridges Telegram-originated prompts
+  to pi extension commands and skill commands.

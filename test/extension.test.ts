@@ -21,6 +21,7 @@ interface Recorded {
 function createFakePi(commandNames: string[] = ["project"]) {
   const recorded: Recorded = { userMessages: [] };
   const handlerLists = new Map<string, Handler[]>();
+  const registeredCommands = new Map<string, any>();
 
   const pi = {
     on: vi.fn((event: string, handler: Handler) => {
@@ -34,9 +35,12 @@ function createFakePi(commandNames: string[] = ["project"]) {
     sendUserMessage: vi.fn((content: string, options?: any) => {
       recorded.userMessages.push({ content, options });
     }),
+    registerCommand: vi.fn((name: string, options: any) => {
+      registeredCommands.set(name, options);
+    }),
   };
 
-  return { pi, recorded, handlers: handlerLists };
+  return { pi, recorded, handlers: handlerLists, registeredCommands };
 }
 
 function inputEvent(text: string, source = "extension") {
@@ -282,5 +286,125 @@ describe("pi-telegram-command-bridge", () => {
       expect(recorded.userMessages[2].content).toContain("/project");
       expect(recorded.userMessages[3].content).toContain("/skill:review");
     });
+  });
+});
+
+// ── /bridge-commands ──────────────────────────────────────────────────────
+
+describe("/bridge-commands", () => {
+  /** Load the extension with a richer command registry. */
+  async function loadWithCommands(commands: Array<{ name: string; source: string; description?: string }>) {
+    vi.resetModules();
+    const mod = await import("../index.ts");
+    const recorded: Recorded = { userMessages: [] };
+    const handlerLists = new Map<string, Handler[]>();
+    const registeredCommands = new Map<string, any>();
+    const notifications: any[] = [];
+    const pi = {
+      on: vi.fn((event: string, handler: Handler) => {
+        const list = handlerLists.get(event) ?? [];
+        list.push(handler);
+        handlerLists.set(event, list);
+      }),
+      getCommands: vi.fn(() => commands),
+      sendUserMessage: vi.fn((content: string, options?: any) => {
+        recorded.userMessages.push({ content, options });
+      }),
+      registerCommand: vi.fn((name: string, options: any) => {
+        registeredCommands.set(name, options);
+      }),
+    };
+    (mod.default as any)(pi);
+    return { pi, recorded, handlers: handlerLists, registeredCommands, notifications };
+  }
+
+  const fakeCtx = () => ({
+    ui: { notify: vi.fn() },
+  });
+
+  it("registers the command with a description", async () => {
+    const { registeredCommands } = await loadWithCommands([]);
+    expect(registeredCommands.has("bridge-commands")).toBe(true);
+    expect(registeredCommands.get("bridge-commands").description).toBeTruthy();
+  });
+
+  it("lists extension and skill commands with descriptions; excludes prompt-source; notes unbridgeables", async () => {
+    const { registeredCommands, recorded } = await loadWithCommands([
+      { name: "project", source: "extension", description: "Switch project" },
+      { name: "voice", source: "skill" },
+      { name: "review", source: "prompt", description: "Review the diff" },
+      { name: "unsafe{n}", source: "extension", description: "bad name" },
+    ]);
+    const ctx = fakeCtx();
+    await registeredCommands.get("bridge-commands").handler("", ctx);
+
+    // local UI got the list
+    const notifyText = (ctx.ui.notify as any).mock.calls[0][0] as string;
+    expect(notifyText).toContain("/project — Switch project");
+    expect(notifyText).toContain("/skill:voice");
+    expect(notifyText).not.toContain("/review");
+    expect(notifyText).toContain("not bridgeable");
+
+    // follow-up dispatched with the verbatim instruction + buttons
+    expect(recorded.userMessages).toHaveLength(1);
+    const followUp = recorded.userMessages[0];
+    expect(followUp.options).toEqual({ deliverAs: "followUp" });
+    expect(followUp.content).toContain("/project — Switch project");
+    expect(followUp.content).toContain("/skill:voice");
+    expect(followUp.content).not.toContain("/review —");
+    expect(followUp.content).toContain("{/project|/project}");
+    expect(followUp.content).toContain("{/skill:voice|/skill:voice}");
+    // unsafe name: plain text, no button cell
+    expect(followUp.content).toContain("/unsafe{n}");
+    expect(followUp.content).not.toContain("{/unsafe{n}");
+  });
+
+  it("handles an empty registry without buttons", async () => {
+    const { registeredCommands, recorded } = await loadWithCommands([]);
+    const ctx = fakeCtx();
+    await registeredCommands.get("bridge-commands").handler("", ctx);
+    expect(recorded.userMessages).toHaveLength(1);
+    expect(recorded.userMessages[0].content).toContain("(none registered)");
+    expect(recorded.userMessages[0].content).not.toContain("telegram_button");
+  });
+
+  it("is forwardable through its own input path (no special casing)", async () => {
+    const commands = [
+      { name: "project", source: "extension" },
+      { name: "bridge-commands", source: "extension" },
+    ];
+    const { handlers, recorded } = await loadWithCommands(commands);
+    const handler = handlers.get("input")?.[0];
+    const result = await handler!(inputEvent("[telegram] /bridge-commands"), {});
+    expect(result).toEqual({ action: "handled" });
+    expect(recorded.userMessages[0].content).toBe("/bridge-commands");
+  });
+
+  it("a dispatched /bridge-commands is settled by the handler follow-up, not the settle timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const commands = [
+        { name: "project", source: "extension" },
+        { name: "bridge-commands", source: "extension" },
+      ];
+      const { pi, handlers, recorded, registeredCommands } = await loadWithCommands(commands);
+      const handler = handlers.get("input")?.[0];
+      await handler!(inputEvent("[telegram] /bridge-commands"), {});
+      // input pass re-dispatched the command
+      expect(recorded.userMessages[0].content).toBe("/bridge-commands");
+      // the real handler runs (normally executed by pi's command machinery):
+      // its follow-up starts an agent turn -> agent_start clears the settle
+      const ctx = fakeCtx();
+      await registeredCommands.get("bridge-commands").handler("", ctx);
+      expect(recorded.userMessages[1].options).toEqual({ deliverAs: "followUp" });
+      const agentStart = handlers.get("agent_start")?.[0];
+      await agentStart!({ type: "agent_start" }, {});
+      await vi.advanceTimersByTimeAsync(3100);
+      // only the re-dispatch + the follow-up: no settle prompt fired
+      expect(recorded.userMessages).toHaveLength(2);
+      expect(recorded.userMessages[1].content).not.toContain("was just executed natively");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
